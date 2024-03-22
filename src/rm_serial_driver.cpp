@@ -29,9 +29,8 @@ RMSerialDriver::RMSerialDriver(const rclcpp::NodeOptions & options)
   serial_driver_{new drivers::serial_driver::SerialDriver(*owned_ctx_)}
 {
   RCLCPP_INFO(get_logger(), "Start RMSerialDriver!");
-
+  initParams();
   getParams();
-
   // TF broadcaster
   timestamp_offset_ = this->declare_parameter("timestamp_offset", 0.0);
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -42,12 +41,17 @@ RMSerialDriver::RMSerialDriver(const rclcpp::NodeOptions & options)
 
   // Detect parameter client
   detector_param_client_ = std::make_shared<rclcpp::AsyncParametersClient>(this, "armor_detector");
-
+  Endetector_param_client_ =
+    std::make_shared<rclcpp::AsyncParametersClient>(this, "energy_detector");
   // Tracker reset service client
   reset_tracker_client_ = this->create_client<std_srvs::srv::Trigger>("/tracker/reset");
   // En Tracker service client
-  reset_en_tracker_mode_client =
-    this->create_client<auto_aim_interfaces::srv::TrackingMode>("EnTracker/resetmode");
+  EnTracker_mode_client =
+    this->create_client<auto_aim_interfaces::srv::TrackingMode>("EnTracker/resetMode");
+  reset_EnTracker_client_ = this->create_client<std_srvs::srv::Trigger>("/EnTracker/reset");
+
+  cam_parameter_client = std::make_shared<rclcpp::AsyncParametersClient>(this, "mv_camera");
+
   try {
     serial_driver_->init_port(device_name_, *device_config_);
     if (!serial_driver_->port()->is_open()) {
@@ -94,7 +98,26 @@ RMSerialDriver::~RMSerialDriver()
     owned_ctx_->waitForExit();
   }
 }
+void RMSerialDriver::initParams()
+{
+  Energy_parameters.emplace_back(rclcpp::Parameter("exposure_time", 5000));
+  Energy_parameters.emplace_back(rclcpp::Parameter("rgb_gain.r", 100));
+  Energy_parameters.emplace_back(rclcpp::Parameter("rgb_gain.g", 100));
+  Energy_parameters.emplace_back(rclcpp::Parameter("rgb_gain.b", 100));
+  Energy_parameters.emplace_back(rclcpp::Parameter(
+    "saturation", Endetector_param_client_->get_parameters({"saturation"}).get().front().as_int()));
+  Energy_parameters.emplace_back(rclcpp::Parameter(
+    "gamma", Endetector_param_client_->get_parameters({"saturation"}).get().front().as_int()));
 
+  Armor_parameters.emplace_back(rclcpp::Parameter("exposure_time", 5000));
+  Armor_parameters.emplace_back(rclcpp::Parameter("rgb_gain.r", 100));
+  Armor_parameters.emplace_back(rclcpp::Parameter("rgb_gain.g", 100));
+  Armor_parameters.emplace_back(rclcpp::Parameter("rgb_gain.b", 100));
+  Armor_parameters.emplace_back(rclcpp::Parameter(
+    "saturation", Endetector_param_client_->get_parameters({"saturation"}).get().front().as_int()));
+  Armor_parameters.emplace_back(rclcpp::Parameter(
+    "gamma", Endetector_param_client_->get_parameters({"saturation"}).get().front().as_int()));
+}
 void RMSerialDriver::receiveData()
 {
   std::vector<uint8_t> header(1);
@@ -121,12 +144,13 @@ void RMSerialDriver::receiveData()
           }
 
           if (packet.reset_tracker) {
-            resetTracker();
+            resetTracker(packet.en_mode);
           }
           if (packet.en_mode != previous_receive_tracker_mode_) {
             previous_receive_tracker_mode_ = packet.en_mode;
             resetEnMode(packet.en_mode);
           }
+
           geometry_msgs::msg::TransformStamped t;
           timestamp_offset_ = this->get_parameter("timestamp_offset").as_double();
           t.header.stamp = this->now() + rclcpp::Duration::from_seconds(timestamp_offset_);
@@ -301,7 +325,10 @@ void RMSerialDriver::setParam(const rclcpp::Parameter & param)
     RCLCPP_WARN(get_logger(), "Service not ready, skipping parameter set");
     return;
   }
-
+  if (!Endetector_param_client_->service_is_ready()) {
+    RCLCPP_WARN(get_logger(), "Service not ready, skipping parameter set");
+    return;
+  }
   if (
     !set_param_future_.valid() ||
     set_param_future_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
@@ -317,10 +344,21 @@ void RMSerialDriver::setParam(const rclcpp::Parameter & param)
         RCLCPP_INFO(get_logger(), "Successfully set detect_color to %ld!", param.as_int());
         initial_set_param_ = true;
       });
+    set_param_future_ = Endetector_param_client_->set_parameters(
+      {param}, [this, param](const ResultFuturePtr & results) {
+        for (const auto & result : results.get()) {
+          if (!result.successful) {
+            RCLCPP_ERROR(get_logger(), "Failed to set parameter: %s", result.reason.c_str());
+            return;
+          }
+        }
+        RCLCPP_INFO(get_logger(), "Successfully set detect_color to %ld!", param.as_int());
+        initial_set_param_ = true;
+      });
   }
 }
 
-void RMSerialDriver::resetTracker()
+void RMSerialDriver::resetTracker(uint8_t mode)
 {
   if (!reset_tracker_client_->service_is_ready()) {
     RCLCPP_WARN(get_logger(), "Service not ready, skipping tracker reset");
@@ -328,7 +366,10 @@ void RMSerialDriver::resetTracker()
   }
 
   auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
-  reset_tracker_client_->async_send_request(request);
+  if (mode == 0)
+    reset_tracker_client_->async_send_request(request);
+  else
+    reset_EnTracker_client_->async_send_request(request);
   RCLCPP_INFO(get_logger(), "Reset tracker!");
 }
 
@@ -355,14 +396,34 @@ void RMSerialDriver::sendEnData(auto_aim_interfaces::msg::EnTarget::SharedPtr ms
 }
 void RMSerialDriver::resetEnMode(uint8_t mode)
 {
-  if (!reset_en_tracker_mode_client->service_is_ready()) {
+  if (!EnTracker_mode_client->service_is_ready()) {
     RCLCPP_WARN(get_logger(), "Service not ready, skipping tracker reset");
     return;
   }
+  setCamParam(mode);
   auto request = std::make_shared<auto_aim_interfaces::srv::TrackingMode_Request>();
   request->mode = mode;
-  reset_en_tracker_mode_client->async_send_request(request);
+  EnTracker_mode_client->async_send_request(request);
 }
+void RMSerialDriver::setCamParam(uint8_t mode)
+{
+  if (!cam_parameter_client->service_is_ready()) {
+    RCLCPP_WARN(get_logger(), "Service not ready, skipping Cam_parameter set");
+    return;
+  }
+  auto future_set = cam_parameter_client->set_parameters_atomically(mode?Armor_parameters:Energy_parameters);
+  if (future_set.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+    auto result = future_set.get();
+    if (result.successful) {
+      RCLCPP_INFO(get_logger(), "Parameter set successfully");
+    } else {
+      RCLCPP_ERROR(get_logger(), "Failed to set parameter");
+    }
+  } else {
+    RCLCPP_ERROR(get_logger(), "Parameter set timed out");
+  }
+}
+
 }  // namespace rm_serial_driver
 
 #include "rclcpp_components/register_node_macro.hpp"
